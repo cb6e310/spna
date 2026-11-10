@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+data/
+runs/
+reports/
+configs/
+config.json
+.venv/
+*.npz
+*.pt
+

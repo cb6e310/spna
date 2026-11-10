@@ -1,0 +1,36 @@
+{
+  "data": {
+    "manifest": "data/zuco2/zuco2_manifest.csv",
+    "text_cache": "data/zuco2/qwen3_embedding_8b.npz"
+  },
+  "model": {
+    "channels": 128,
+    "max_samples": 1280,
+    "patch_size": 16,
+    "hidden_dim": 256,
+    "encoder_layers": 4,
+    "attention_heads": 8,
+    "dropout": 0.1,
+    "text_dim": 4096,
+    "projection_hidden_dim": 512,
+    "embedding_dim": 256
+  },
+  "capacities": {
+    "small": 64,
+    "small_temperature": 0.07,
+    "large_temperature": 0.07
+  },
+  "teacher": {
+    "name": "Qwen3-Embedding-8B",
+    "relation_temperature": 0.1,
+    "eta": 0.2,
+    "eta_validation_candidates": [0.1, 0.2, 0.3]
+  },
+  "training": {
+    "batch_size": 72,
+    "eval_batch_size": 128,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0
+  }
+}

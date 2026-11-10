@@ -25,7 +25,7 @@ def text_relation_target(
 
     mask = ~torch.eye(batch, dtype=torch.bool, device=frozen_text.device)
     if mode == "uniform":
-        relations = mask.to(frozen_text.dtype)
+        relations = mask.to(frozen_text.dtype) / (batch - 1)
     else:
         teacher = F.normalize(frozen_text.detach().float(), dim=-1)
         logits = (teacher @ teacher.T) / temperature
@@ -43,18 +43,32 @@ def text_relation_target(
     return relations.detach()
 
 
-def mixed_target(relations: torch.Tensor, eta: float) -> torch.Tensor:
-    if not 0 <= eta < 1:
-        raise ValueError("eta must satisfy 0 <= eta < 1")
-    batch = relations.shape[0]
-    identity = torch.eye(batch, dtype=relations.dtype, device=relations.device)
-    return ((1.0 - eta) * identity + eta * relations).detach()
-
-
 def distribution_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if logits.shape != target.shape or logits.ndim != 2:
         raise ValueError("logits and target must have matching [batch, candidates] shapes")
     return F.kl_div(F.log_softmax(logits.float(), dim=-1), target.float(), reduction="batchmean")
+
+
+def negative_relation_loss(
+    small_logits: torch.Tensor,
+    relations: torch.Tensor,
+) -> torch.Tensor:
+    """KL(Q_neg || P_neg) with each row normalized over non-paired candidates only."""
+    if small_logits.shape != relations.shape or small_logits.ndim != 2:
+        raise ValueError("small_logits and relations must have matching [batch, batch] shapes")
+    if small_logits.shape[0] != small_logits.shape[1] or small_logits.shape[0] < 2:
+        raise ValueError("Relation logits must be square with at least two candidates")
+    mask = ~torch.eye(small_logits.shape[0], dtype=torch.bool, device=small_logits.device)
+    target = relations.detach().float().masked_fill(~mask, 0.0)
+    row_sums = target.sum(dim=-1, keepdim=True)
+    if not torch.isfinite(target).all() or (target < 0).any() or (row_sums <= 0).any():
+        raise ValueError("Teacher relation rows must have positive finite non-paired mass")
+    target = target / row_sums
+    log_probs = F.log_softmax(
+        small_logits.float().masked_fill(~mask, torch.finfo(torch.float32).min), dim=-1
+    )
+    log_probs = torch.where(mask, log_probs, torch.zeros_like(log_probs))
+    return F.kl_div(log_probs, target, reduction="batchmean")
 
 
 def hard_pair_loss(logits: torch.Tensor) -> torch.Tensor:
@@ -67,23 +81,22 @@ def hard_pair_loss(logits: torch.Tensor) -> torch.Tensor:
 def spna_objective(
     small_logits: torch.Tensor,
     large_logits: torch.Tensor,
-    relations: torch.Tensor,
-    eta: float,
+    relations: torch.Tensor | None,
+    lambda_relation: float = 0.0,
     alpha_small: float = 0.5,
     alpha_large: float = 0.5,
-    small_mode: str = "carg",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if alpha_small < 0 or alpha_large < 0 or alpha_small + alpha_large <= 0:
         raise ValueError("Capacity weights must be nonnegative and not both zero")
-    if small_mode == "carg":
-        small_target = mixed_target(relations, eta)
-        small_loss = distribution_loss(small_logits, small_target)
-    elif small_mode == "hard":
-        small_loss = hard_pair_loss(small_logits)
-    elif small_mode == "disabled":
-        small_loss = small_logits.sum() * 0.0
-    else:
-        raise ValueError(f"Unknown small_mode: {small_mode}")
+    if lambda_relation < 0:
+        raise ValueError("lambda_relation must be nonnegative")
+    small_loss = hard_pair_loss(small_logits)
     large_loss = hard_pair_loss(large_logits)
-    total = alpha_small * small_loss + alpha_large * large_loss
-    return total, {"small": small_loss.detach(), "large": large_loss.detach()}
+    if lambda_relation > 0 and relations is None:
+        raise ValueError("relations are required when lambda_relation is positive")
+    relation_loss = (negative_relation_loss(small_logits, relations)
+                     if lambda_relation > 0 else small_logits.sum() * 0.0)
+    total = (alpha_small * small_loss + alpha_large * large_loss
+             + lambda_relation * relation_loss)
+    return total, {"small": small_loss.detach(), "large": large_loss.detach(),
+                   "relation": relation_loss.detach()}

@@ -2,9 +2,11 @@
 
 This isolated prototype adds modality-specific projection heads and SPNA nested
 CARG supervision to GLIM's native EEG encoder, aligner, and generation loss.
-The 64-dimensional prefix uses the FLAN-T5 text-relation target; the 256-
-dimensional prefix uses hard paired retrieval supervision. The combined
-runner retains GLIM's native contrastive and generation objectives.
+Both 64- and 256-dimensional prefixes use hard paired retrieval supervision.
+An independent relation KL on the 64-dimensional prefix matches teacher and
+student distributions over non-paired candidates only, weighted by
+`lambda_relation`. The combined runner retains GLIM's native contrastive and
+generation objectives.
 
 The runner expects the existing GLIM checkout at `/home/song/projects/glim_zuco`
 and the already-prepared ZuCo2 / FLAN-T5 assets. It can be invoked with

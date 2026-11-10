@@ -12,14 +12,15 @@ class GLIMSPNAIncrementTests(unittest.TestCase):
         teacher = torch.randn(5, 64, requires_grad=True)
         loss, parts = nested_carg_objective(
             eeg, text, teacher, small_dim=8, large_dim=24,
-            eta=0.2, relation_temperature=0.1, logit_temperature=0.07,
+            lambda_relation=0.1, relation_temperature=0.1, logit_temperature=0.07,
         )
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(eeg.grad)
         self.assertIsNotNone(text.grad)
         self.assertIsNone(teacher.grad)
-        self.assertEqual(set(parts), {"small", "large"})
+        self.assertEqual(set(parts), {"small", "large", "relation"})
+        self.assertTrue(all(torch.isfinite(value) for value in parts.values()))
 
 
 if __name__ == "__main__":

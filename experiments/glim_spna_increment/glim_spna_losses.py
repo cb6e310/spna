@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from torch.nn import functional as F
 
-from spna.losses import distribution_loss, hard_pair_loss, mixed_target, text_relation_target
+from spna.losses import hard_pair_loss, negative_relation_loss, text_relation_target
 
 def nested_carg_objective(
     eeg_vectors: torch.Tensor,
@@ -13,7 +13,7 @@ def nested_carg_objective(
     frozen_teacher: torch.Tensor,
     small_dim: int = 64,
     large_dim: int = 256,
-    eta: float = 0.2,
+    lambda_relation: float = 0.1,
     relation_temperature: float = 0.1,
     logit_temperature: float = 0.07,
     alpha_small: float = 0.5,
@@ -35,11 +35,12 @@ def nested_carg_objective(
         raise ValueError("Require 0 < small_dim <= large_dim <= student embedding dimensions")
     if logit_temperature <= 0:
         raise ValueError("logit_temperature must be positive")
+    if lambda_relation < 0:
+        raise ValueError("lambda_relation must be nonnegative")
     if alpha_small < 0 or alpha_large < 0 or alpha_small + alpha_large <= 0:
         raise ValueError("Capacity weights must be nonnegative and not both zero")
 
     relations = text_relation_target(frozen_teacher, relation_temperature)
-    target = mixed_target(relations, eta)
     small_logits = (
         F.normalize(eeg_vectors[:, :small_dim].float(), dim=-1)
         @ F.normalize(text_vectors[:, :small_dim].float(), dim=-1).T
@@ -48,7 +49,9 @@ def nested_carg_objective(
         F.normalize(eeg_vectors[:, :large_dim].float(), dim=-1)
         @ F.normalize(text_vectors[:, :large_dim].float(), dim=-1).T
     ) / logit_temperature
-    small_loss = distribution_loss(small_logits, target)
+    small_loss = hard_pair_loss(small_logits)
     large_loss = hard_pair_loss(large_logits)
-    total = alpha_small * small_loss + alpha_large * large_loss
-    return total, {"small": small_loss.detach(), "large": large_loss.detach()}
+    relation_loss = negative_relation_loss(small_logits, relations)
+    total = alpha_small * small_loss + alpha_large * large_loss + lambda_relation * relation_loss
+    return total, {"small": small_loss.detach(), "large": large_loss.detach(),
+                   "relation": relation_loss.detach()}

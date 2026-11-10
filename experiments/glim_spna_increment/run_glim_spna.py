@@ -38,8 +38,8 @@ MICRO_BATCH = 12
 BATCH_SIZE = 72
 SMALL_DIM = 64
 LARGE_DIM = 256
-ETA = 0.2
-RELATION_TEMPERATURE = 0.1
+LAMBDA_RELATION = 0.1
+RELATION_TEMPERATURE = 0.05
 LOGIT_TEMPERATURE = 0.07
 EXPECTED_BATCH_HASH = fair.EXPECTED_BATCH_HASH
 
@@ -198,10 +198,11 @@ def train(frame, cache: dict, hp: dict, device: str) -> nn.Module:
         "spna_increment": {
             "method": "nested CARG on projected GLIM embeddings",
             "large_dimension": LARGE_DIM, "small_dimension": SMALL_DIM,
-            "eta": ETA, "relation_temperature": RELATION_TEMPERATURE,
+            "lambda_relation": LAMBDA_RELATION,
+            "relation_temperature": RELATION_TEMPERATURE,
             "logit_temperature": LOGIT_TEMPERATURE,
             "teacher": "frozen FLAN token hidden states with attention-mask mean pooling",
-            "capacity_weights": {"small_carg": 0.5, "large_hard_pair": 0.5},
+            "capacity_weights": {"small_hard_pair": 0.5, "large_hard_pair": 0.5},
         },
         "combined_weights": {"glim_cmc": 0.25, "spna_nested_carg": 0.25,
                              "glim_generation": 0.5},
@@ -247,7 +248,8 @@ def train(frame, cache: dict, hp: dict, device: str) -> nn.Module:
             glim_cmc, _ = model.aligner.align_emb_vector(eeg_leaf, text_leaf)
             spna_carg, carg_parts = nested_carg_objective(
                 eeg_nested_leaf, text_nested_leaf, teacher,
-                small_dim=SMALL_DIM, large_dim=LARGE_DIM, eta=ETA,
+                small_dim=SMALL_DIM, large_dim=LARGE_DIM,
+                lambda_relation=LAMBDA_RELATION,
                 relation_temperature=RELATION_TEMPERATURE,
                 logit_temperature=LOGIT_TEMPERATURE,
             )
@@ -292,6 +294,7 @@ def train(frame, cache: dict, hp: dict, device: str) -> nn.Module:
                    "spna_carg": float(spna_carg.detach()),
                    "spna_small": float(carg_parts["small"]),
                    "spna_large": float(carg_parts["large"]),
+                   "spna_relation": float(carg_parts["relation"]),
                    "lm": loss_lm_total,
                    "max_cuda_gb": torch.cuda.max_memory_allocated() / 1e9}
             trace.write(json.dumps(row) + "\n")
@@ -333,7 +336,8 @@ def preflight(frame, cache: dict, hp: dict, device: str) -> None:
         cmc, _ = model.aligner.align_emb_vector(eeg_vec.float(), text_vec.float())
         carg, _parts = nested_carg_objective(
             eeg_nested.float(), text_nested.float(), teacher,
-            small_dim=SMALL_DIM, large_dim=LARGE_DIM, eta=ETA,
+            small_dim=SMALL_DIM, large_dim=LARGE_DIM,
+            lambda_relation=LAMBDA_RELATION,
             relation_temperature=RELATION_TEMPERATURE,
             logit_temperature=LOGIT_TEMPERATURE)
         labels = cache["targets"][micro["uid"].cpu(), micro["variant"].cpu()].to(device).clone()

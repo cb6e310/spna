@@ -20,17 +20,14 @@ from .model import ModelConfig, SPNA
 
 
 VARIANTS = {
-    "d_only": {"small_mode": "disabled", "alpha_small": 0.0, "alpha_large": 1.0,
-               "relation_mode": "true"},
-    "small_only": {"small_mode": "hard", "alpha_small": 1.0, "alpha_large": 0.0,
-                   "relation_mode": "true"},
-    "nested_hard": {"small_mode": "hard", "alpha_small": 0.5, "alpha_large": 0.5,
-                    "relation_mode": "true"},
-    "spna_carg": {"small_mode": "carg", "alpha_small": 0.5, "alpha_large": 0.5,
+    "d_only": {"alpha_small": 0.0, "alpha_large": 1.0, "relation_mode": "none"},
+    "small_only": {"alpha_small": 1.0, "alpha_large": 0.0, "relation_mode": "none"},
+    "nested_hard": {"alpha_small": 0.5, "alpha_large": 0.5, "relation_mode": "none"},
+    "spna_carg": {"alpha_small": 0.5, "alpha_large": 0.5,
                   "relation_mode": "true"},
-    "uniform_smoothing": {"small_mode": "carg", "alpha_small": 0.5, "alpha_large": 0.5,
+    "uniform_smoothing": {"alpha_small": 0.5, "alpha_large": 0.5,
                           "relation_mode": "uniform"},
-    "shuffled_relations": {"small_mode": "carg", "alpha_small": 0.5, "alpha_large": 0.5,
+    "shuffled_relations": {"alpha_small": 0.5, "alpha_large": 0.5,
                            "relation_mode": "shuffled"},
 }
 
@@ -87,8 +84,14 @@ def evaluate_validation(model: SPNA, dataset: ZuCoManifestDataset, cfg: dict,
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.steps < 1:
+        raise ValueError("steps must be positive")
     config_path = args.config.resolve()
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    if float(cfg["teacher"]["relation_temperature"]) <= 0:
+        raise ValueError("teacher relation_temperature must be positive")
+    if float(cfg["teacher"]["lambda_relation"]) < 0:
+        raise ValueError("teacher lambda_relation must be nonnegative")
     variant = VARIANTS[args.variant]
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,7 +149,10 @@ def run(args: argparse.Namespace) -> None:
     loader = DataLoader(train_data, batch_sampler=sampler, num_workers=0,
                         collate_fn=collate_trials, pin_memory=(device.type == "cuda"))
     trace_path = output_dir / "train.jsonl"
-    best_small_r1 = -1.0
+    best_small_r1 = float("-inf")
+    best_epoch = 0
+    best_step = 0
+    best_validation = None
     start = time.monotonic()
     optimizer_step = 0
 
@@ -176,19 +182,21 @@ def run(args: argparse.Namespace) -> None:
                     eeg_vectors, text_vectors, cfg["model"]["embedding_dim"],
                     cfg["capacities"]["large_temperature"],
                 )
+                lambda_relation = (
+                    cfg["teacher"]["lambda_relation"]
+                    if variant["relation_mode"] != "none" else 0.0
+                )
                 relations = (
                     text_relation_target(
                         frozen_text, cfg["teacher"]["relation_temperature"],
                         mode=variant["relation_mode"],
-                    )
-                    if variant["small_mode"] == "carg"
-                    else torch.zeros_like(small_logits)
+                    ) if lambda_relation > 0 else None
                 )
                 loss, components = spna_objective(
-                    small_logits, large_logits, relations, cfg["teacher"]["eta"],
+                    small_logits, large_logits, relations,
+                    lambda_relation=lambda_relation,
                     alpha_small=variant["alpha_small"],
                     alpha_large=variant["alpha_large"],
-                    small_mode=variant["small_mode"],
                 )
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at epoch={epoch}")
@@ -202,6 +210,10 @@ def run(args: argparse.Namespace) -> None:
                     "step": optimizer_step,
                     "epoch": epoch + 1,
                     "train_loss": float(loss.detach()),
+                    "hard_small_loss": float(components["small"]),
+                    "hard_large_loss": float(components["large"]),
+                    "relation_loss": float(components["relation"]),
+                    "lambda_relation": lambda_relation,
                     "seconds": time.monotonic() - start,
                     "max_cuda_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
                 }
@@ -209,24 +221,35 @@ def run(args: argparse.Namespace) -> None:
                 if optimizer_step == 1 or optimizer_step % 25 == 0:
                     print(json.dumps(record), flush=True)
             epoch += 1
-
-        validation = evaluate_validation(model, validation_data, cfg, device)
-        best_small_r1 = validation["small"]["r@1"]
-        torch.save(
-            {
-                "config": cfg,
-                "variant": args.variant,
-                "seed": args.seed,
-                "train_fraction": args.train_fraction,
-                "train_stimuli": len(train_data.stimulus_ids),
+            validation = evaluate_validation(model, validation_data, cfg, device)
+            current_small_r1 = validation["small"]["r@1"]
+            trace.write(json.dumps({
                 "epoch": epoch,
                 "step": optimizer_step,
                 "validation": validation,
-                "selected_by": f"fixed {args.steps}-step training budget; validation is diagnostic only",
-                "model_state": model.state_dict(),
-            },
-            output_dir / "best.pt",
-        )
+                "validation_small_r1": current_small_r1,
+                "seconds": time.monotonic() - start,
+            }) + "\n")
+            if current_small_r1 > best_small_r1:
+                best_small_r1 = current_small_r1
+                best_epoch = epoch
+                best_step = optimizer_step
+                best_validation = validation
+                torch.save(
+                    {
+                        "config": cfg,
+                        "variant": args.variant,
+                        "seed": args.seed,
+                        "train_fraction": args.train_fraction,
+                        "train_stimuli": len(train_data.stimulus_ids),
+                        "epoch": best_epoch,
+                        "step": best_step,
+                        "validation": best_validation,
+                        "selected_by": "best validation small-capacity full-bank R@1",
+                        "model_state": model.state_dict(),
+                    },
+                    output_dir / "best.pt",
+                )
     (output_dir / "run.json").write_text(json.dumps({
         "variant": args.variant,
         "seed": args.seed,
@@ -234,9 +257,12 @@ def run(args: argparse.Namespace) -> None:
         "train_stimuli": len(train_data.stimulus_ids),
         "epochs": epoch,
         "optimizer_steps": optimizer_step,
+        "best_epoch": best_epoch,
+        "best_step": best_step,
         "best_validation_small_r1": best_small_r1,
+        "best_validation": best_validation,
         "elapsed_seconds": time.monotonic() - start,
-        "selected_by": "fixed-step training budget; validation is diagnostic only",
+        "selected_by": "best validation small-capacity full-bank R@1",
         "test_evaluated": False,
     }, indent=2), encoding="utf-8")
 

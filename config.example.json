@@ -23,8 +23,7 @@
   "teacher": {
     "name": "Qwen3-Embedding-8B",
     "relation_temperature": 0.1,
-    "eta": 0.2,
-    "eta_validation_candidates": [0.1, 0.2, 0.3]
+    "lambda_relation": 0.1
   },
   "training": {
     "batch_size": 72,

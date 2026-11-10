@@ -5,7 +5,7 @@ This folder contains a runnable PyTorch implementation of the SPNA-CARG method i
 ## Implementation scope
 
 - Shared maximum-width EEG and text projections with independently normalized prefixes.
-- Low-capacity CARG target `q_tilde = (1 - eta) * one_hot + eta * q_text` and high-capacity hard pair CE.
+- Hard pair cross-entropy at both 64- and 256-dimensional capacities, plus an independently weighted 64-dimensional relation KL over non-paired candidates.
 - True, uniform and shuffled relation targets; `d_only`, `small_only`, `nested_hard` and `spna_carg` comparisons.
 - Unique-stimulus batches with one rotating EEG trial per stimulus, and stimulus-disjoint manifest validation.
 - Full-bank R@1, R@5 and MRR on validation and test splits.
@@ -62,6 +62,11 @@ python -m spna.evaluate \
   --output ./runs/spna_carg/fraction_1/seed_42/test.json
 ```
 
+For the cached FLAN-T5-large teacher on the 4090 server, start from
+`config.flan_t5_large.example.json`. Its `relation_temperature` and
+`lambda_relation` are independent settings for the teacher distribution and
+the relation-loss weight.
+
 The default `benchmark` protocol preserves the fixed 24-candidate GLIM-style evaluation. Use `--protocol full_bank` for all unique test stimuli, or `--protocol both` to report both protocols in one JSON file. Full-bank results include small- and full-capacity R@1/R@5/MRR; the 24-candidate benchmark remains a separate secondary comparison.
 
 Supported variants are `d_only`, `small_only`, `nested_hard`, `spna_carg`, `uniform_smoothing` and `shuffled_relations`. Use the same seed and training fraction for each comparison. The 25%, 50% and 100% subsets are nested and selected deterministically by seed:
@@ -81,13 +86,13 @@ python run_key_ablations.py \
   --seeds 42 43 44 45 46 --devices 0 1 2 --steps 500
 ```
 
-The suite evaluates all six full-data variants and D-only/SPNA-CARG at 25% and 50% training stimuli. Each run stores its config, fixed-step checkpoint, run metadata and compact test metrics; `ablation_summary.json` reports seed mean and sample standard deviation.
+The suite evaluates all six full-data variants and D-only/SPNA-CARG at 25% and 50% training stimuli. Each run stores its config, best-validation checkpoint, run metadata and compact test metrics; `ablation_summary.json` reports seed mean and sample standard deviation.
 
-Training selects the checkpoint on validation small-capacity full-bank R@1 and does not read test metrics. Run test evaluation only after model and hyperparameters have been selected. Repeat with five seeds for the paper protocol.
+Training evaluates validation small-capacity full-bank R@1 after each epoch and saves the best epoch as `best.pt`; it does not read test metrics. Run test evaluation only after model and hyperparameters have been selected. Repeat with five seeds for the paper protocol.
 
 ## Configuration choices still requiring validation
 
-The example config uses `d_s=64`, `D=256`, `eta=0.2`, batch size 72, Adam with learning rate 1e-4 and no weight decay, matching the prior GLIM rapid-training budget. These are controlled starting points, not validated optima. Search `eta` over 0.1/0.2/0.3 and tune temperatures and capacity weights on validation only. The training code's initial variant weights mirror the spec's suggested 0.5/0.5; adjust them only through validation runs.
+The example configs use `d_s=64`, `D=256`, `lambda_relation=0.1`, batch size 72, Adam with learning rate 1e-4 and no weight decay; the generic Qwen config uses `T_T=0.1`, and the FLAN-specific config uses `T_T=0.05`. The relation target `Q_neg^T` and student distribution `P_neg^64` are each normalized over non-paired candidates only; the relation KL is added separately to the two hard-pair CE terms. These values are starting points, not validated optima. Tune `lambda_relation`, `relation_temperature`, and capacity weights using validation data only. The training code selects the best validation small-capacity full-bank R@1 checkpoint after each epoch.
 
 ## ZuCo2 GLIM-style test benchmark
 

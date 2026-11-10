@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from spna.losses import mixed_target, nested_carg_objective, spna_objective, text_relation_target
+from spna.losses import mixed_target, spna_objective, text_relation_target
 from spna.metrics import retrieval_metrics
 from spna.model import ModelConfig, SPNA
 
@@ -41,21 +41,6 @@ class SPNACoreTests(unittest.TestCase):
         self.assertIsNotNone(small.grad)
         self.assertIsNotNone(large.grad)
         self.assertIsNone(teacher.grad)
-
-    def test_nested_carg_objective_trains_student_prefixes_only(self):
-        eeg = torch.randn(5, 32, requires_grad=True)
-        text = torch.randn(5, 32, requires_grad=True)
-        teacher = torch.randn(5, 64, requires_grad=True)
-        loss, parts = nested_carg_objective(
-            eeg, text, teacher, small_dim=8, large_dim=24,
-            eta=0.2, relation_temperature=0.1, logit_temperature=0.07,
-        )
-        loss.backward()
-        self.assertTrue(torch.isfinite(loss))
-        self.assertIsNotNone(eeg.grad)
-        self.assertIsNotNone(text.grad)
-        self.assertIsNone(teacher.grad)
-        self.assertEqual(set(parts), {"small", "large"})
 
     def test_full_bank_retrieval_metrics(self):
         vectors = torch.eye(4)

@@ -3,7 +3,9 @@ import unittest
 import torch
 
 from spna.embed_qwen3 import masked_mean_pool
-from spna.losses import hard_pair_loss, negative_relation_loss, spna_objective, text_relation_target
+from spna.losses import (gradient_conflict_diagnostics, hard_pair_loss,
+                         negative_relation_loss, spna_objective, text_relation_target,
+                         weighted_capacity_loss)
 from spna.metrics import retrieval_metrics
 from spna.model import ModelConfig, SPNA
 
@@ -76,6 +78,24 @@ class SPNACoreTests(unittest.TestCase):
         self.assertEqual(result["r@1"], 1.0)
         self.assertEqual(result["mrr"], 1.0)
         self.assertEqual(result["n_candidates"], 4.0)
+
+    def test_gradient_conflict_diagnostics_reports_pairwise_cosine(self):
+        parameter = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+        first = parameter[0] * parameter[1]
+        second = -parameter[0] * parameter[1]
+        result = gradient_conflict_diagnostics({"64": first, "256": second}, [parameter])
+        self.assertIn("cos_64_256", result)
+        self.assertAlmostEqual(result["cos_64_256"], -1.0, places=6)
+
+    def test_weighted_capacity_loss_combines_all_nested_targets(self):
+        logits = [torch.randn(4, 4, requires_grad=True) for _ in range(3)]
+        weights = [0.35, 0.15, 0.50]
+        total, losses = weighted_capacity_loss(logits, weights)
+        expected = sum(weight * hard_pair_loss(value) for weight, value in zip(weights, logits))
+        self.assertTrue(torch.allclose(total, expected))
+        self.assertEqual(set(losses), {"0", "1", "2"})
+        total.backward()
+        self.assertTrue(all(value.grad is not None for value in logits))
 
 
 if __name__ == "__main__":

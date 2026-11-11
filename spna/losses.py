@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from itertools import combinations
+from typing import Sequence
+
 import torch
 from torch.nn import functional as F
 
@@ -76,6 +79,46 @@ def hard_pair_loss(logits: torch.Tensor) -> torch.Tensor:
         raise ValueError("Pair logits must be a square [batch, batch] matrix")
     labels = torch.arange(logits.shape[0], device=logits.device)
     return F.cross_entropy(logits.float(), labels)
+
+
+def weighted_capacity_loss(
+    logits_by_capacity: Sequence[torch.Tensor],
+    weights: Sequence[float],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Combine hard-pair losses for nested embedding prefixes."""
+    if not logits_by_capacity or len(logits_by_capacity) != len(weights):
+        raise ValueError("Each capacity logit matrix must have one weight")
+    if any(weight < 0 for weight in weights) or sum(weights) <= 0:
+        raise ValueError("Capacity weights must be nonnegative and not all zero")
+    losses = [hard_pair_loss(logits) for logits in logits_by_capacity]
+    total = sum(float(weight) * loss for weight, loss in zip(weights, losses))
+    return total, {str(index): loss for index, loss in enumerate(losses)}
+
+
+def gradient_conflict_diagnostics(
+    losses_by_capacity: dict[str, torch.Tensor],
+    shared_parameters: Sequence[torch.nn.Parameter],
+) -> dict[str, float]:
+    """Measure pairwise gradient cosine and norms on shared model parameters."""
+    names = list(losses_by_capacity)
+    gradients: dict[str, tuple[torch.Tensor | None, ...]] = {}
+    for name, loss in losses_by_capacity.items():
+        gradients[name] = torch.autograd.grad(
+            loss, shared_parameters, retain_graph=True, allow_unused=True
+        )
+
+    result: dict[str, float] = {}
+    flattened: dict[str, torch.Tensor] = {}
+    for name, grads in gradients.items():
+        pieces = [grad.detach().float().reshape(-1) for grad in grads if grad is not None]
+        flattened[name] = torch.cat(pieces) if pieces else torch.zeros(1)
+        result[f"norm_{name}"] = float(flattened[name].norm().cpu())
+    for left, right in combinations(names, 2):
+        a, b = flattened[left], flattened[right]
+        denominator = a.norm() * b.norm()
+        cosine = torch.dot(a, b) / denominator.clamp_min(1e-12)
+        result[f"cos_{left}_{right}"] = float(cosine.cpu())
+    return result
 
 
 def spna_objective(

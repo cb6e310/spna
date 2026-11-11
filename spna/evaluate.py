@@ -128,7 +128,8 @@ def evaluate_glim_batches(model: SPNA, dataset: ZuCoManifestDataset, cfg: dict,
 
 @torch.inference_mode()
 def evaluate_full_bank(model: SPNA, dataset: ZuCoManifestDataset, cfg: dict,
-                       device: torch.device, batch_size: int) -> dict:
+                       device: torch.device, batch_size: int,
+                       evaluation_dimensions: list[int] | None = None) -> dict:
     """Evaluate every trial against every unique stimulus in the split."""
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -146,13 +147,19 @@ def evaluate_full_bank(model: SPNA, dataset: ZuCoManifestDataset, cfg: dict,
     target_indices = torch.tensor([candidate_index[stimulus] for stimulus in targets])
     eeg_vectors = torch.cat(eeg_vectors)
     full_dim = cfg["model"]["embedding_dim"]
+    evaluation_dimensions = evaluation_dimensions or [cfg["capacities"]["small"], full_dim]
     return {
+        "capacity_metrics": {
+            str(dimension): retrieval_metrics(
+                eeg_vectors, candidate_vectors, target_indices, dimension
+            ) for dimension in evaluation_dimensions
+        },
         "candidate_stimuli": len(candidate_ids),
         "small_capacity": retrieval_metrics(
             eeg_vectors, candidate_vectors, target_indices, cfg["capacities"]["small"]
         ),
         "full_capacity": retrieval_metrics(eeg_vectors, candidate_vectors, target_indices, full_dim),
-        "primary_metric": "full-bank EEG-to-text R@1 at small capacity",
+        "primary_metric": "full-bank EEG-to-text retrieval metrics by capacity",
     }
 
 
@@ -190,7 +197,8 @@ def main() -> None:
             metrics["glim_benchmark"] = benchmark
         if args.protocol in {"full_bank", "both"}:
             metrics["full_bank"] = evaluate_full_bank(
-                model, dataset, cfg, device, args.batch_size
+                model, dataset, cfg, device, args.batch_size,
+                checkpoint.get("evaluation_dimensions"),
             )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -201,7 +209,10 @@ def main() -> None:
                 "\n".join(json.dumps(row) for row in noise_predictions) + "\n", encoding="utf-8")
         print(json.dumps(metrics, indent=2))
         return
-    metrics = evaluate_full_bank(model, dataset, cfg, device, args.batch_size)
+    metrics = evaluate_full_bank(
+        model, dataset, cfg, device, args.batch_size,
+        checkpoint.get("evaluation_dimensions"),
+    )
     metrics.update({"split": args.split, "variant": checkpoint["variant"],
                     "seed": checkpoint["seed"], "checkpoint_epoch": checkpoint["epoch"]})
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -14,7 +14,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import UniqueStimulusBatchSampler, ZuCoManifestDataset, load_text_cache, read_manifest
-from .losses import spna_objective, text_relation_target
+from .losses import (gradient_conflict_diagnostics, hard_pair_loss,
+                     negative_relation_loss, spna_objective, text_relation_target,
+                     weighted_capacity_loss)
 from .metrics import retrieval_metrics
 from .model import ModelConfig, SPNA
 
@@ -29,6 +31,8 @@ VARIANTS = {
                           "relation_mode": "uniform"},
     "shuffled_relations": {"alpha_small": 0.5, "alpha_large": 0.5,
                            "relation_mode": "shuffled"},
+    "nested_three": {"relation_mode": "none", "capacity_mode": "three_layer"},
+    "staged_nested_three": {"relation_mode": "none", "capacity_mode": "three_layer_staged"},
 }
 
 
@@ -59,7 +63,7 @@ def collate_trials(batch: list[dict]) -> dict:
 
 @torch.no_grad()
 def evaluate_validation(model: SPNA, dataset: ZuCoManifestDataset, cfg: dict,
-                        device: torch.device) -> dict:
+                        device: torch.device, dimensions: list[int]) -> dict:
     model.eval()
     loader = DataLoader(dataset, batch_size=cfg["training"]["eval_batch_size"],
                         shuffle=False, num_workers=0, collate_fn=collate_trials)
@@ -76,10 +80,10 @@ def evaluate_validation(model: SPNA, dataset: ZuCoManifestDataset, cfg: dict,
     target_map = {stimulus: i for i, stimulus in enumerate(candidate_ids)}
     target_indices = torch.tensor([target_map[stimulus] for stimulus in target_ids])
     eeg_vectors = torch.cat(eeg_vectors)
-    small_dim, full_dim = cfg["capacities"]["small"], cfg["model"]["embedding_dim"]
     return {
-        "small": retrieval_metrics(eeg_vectors, candidate_vectors, target_indices, small_dim),
-        "full": retrieval_metrics(eeg_vectors, candidate_vectors, target_indices, full_dim),
+        str(dimension): retrieval_metrics(
+            eeg_vectors, candidate_vectors, target_indices, dimension
+        ) for dimension in dimensions
     }
 
 
@@ -126,6 +130,60 @@ def run(args: argparse.Namespace) -> None:
     if cfg["capacities"]["small"] >= cfg["model"]["embedding_dim"]:
         raise ValueError("small capacity must be less than embedding_dim")
 
+    multi_capacity = variant.get("capacity_mode", "") in {
+        "three_layer", "three_layer_staged"
+    }
+    dimensions = ([int(value) for value in cfg["capacities"].get(
+        "layers", [cfg["capacities"]["small"], 128, cfg["model"]["embedding_dim"]]
+    )] if multi_capacity else [
+        int(cfg["capacities"]["small"]), int(cfg["model"]["embedding_dim"])
+    ])
+    if sorted(set(dimensions)) != dimensions or dimensions[-1] != int(cfg["model"]["embedding_dim"]):
+        raise ValueError("Capacity layers must be increasing and end at embedding_dim")
+    if dimensions[0] != int(cfg["capacities"]["small"]):
+        raise ValueError("First capacity layer must match capacities.small")
+    if any(value < 1 or value > int(cfg["model"]["embedding_dim"]) for value in dimensions):
+        raise ValueError("Capacity layers must lie within the model embedding dimension")
+    weights = ([float(value) for value in cfg["capacities"].get("weights", [0.35, 0.15, 0.50])]
+               if multi_capacity else [float(variant["alpha_small"]),
+                                      float(variant["alpha_large"])])
+    if (len(weights) != len(dimensions) or any(value < 0 for value in weights)
+            or abs(sum(weights) - 1.0) > 1e-6):
+        raise ValueError("Capacity weights must match layers and sum to one")
+    evaluation_dimensions = [int(value) for value in cfg["capacities"].get(
+        "evaluation_layers", dimensions
+    )]
+    if (not evaluation_dimensions
+            or sorted(set(evaluation_dimensions)) != evaluation_dimensions
+            or evaluation_dimensions[0] < 1
+            or evaluation_dimensions[-1] > int(cfg["model"]["embedding_dim"])):
+        raise ValueError("Evaluation capacities must be increasing and within embedding_dim")
+    selection_weights = [float(value) for value in cfg["capacities"].get(
+        "selection_weights", [1.0] + [0.0] * (len(evaluation_dimensions) - 1)
+    )]
+    if len(selection_weights) != len(evaluation_dimensions) or abs(sum(selection_weights) - 1.0) > 1e-6:
+        raise ValueError("Selection weights must match evaluation_layers and sum to one")
+    selection_description = (
+        "best weighted validation full-bank R@1 across capacities"
+        if "selection_weights" in cfg["capacities"]
+        else "best validation small-capacity full-bank R@1"
+    )
+
+    if variant.get("capacity_mode") == "three_layer_staged":
+        warmup_steps = int(round(args.steps * float(
+            cfg["training"].get("high_capacity_warmup_fraction", 0.25)
+        )))
+        if not 0 < warmup_steps < args.steps:
+            raise ValueError("High-capacity warmup must leave steps for nested fine-tuning")
+        phases = [
+            {"name": "high_capacity_warmup", "steps": warmup_steps,
+             "weights": [0.0] * (len(dimensions) - 1) + [1.0], "select": False},
+            {"name": "nested_finetune", "steps": args.steps - warmup_steps,
+             "weights": weights, "select": True},
+        ]
+    else:
+        phases = [{"name": "joint", "steps": args.steps, "weights": weights, "select": True}]
+
     output_dir = Path(args.output) / args.variant / f"fraction_{args.train_fraction:g}" / f"seed_{args.seed}"
     output_dir.mkdir(parents=True, exist_ok=False)
     run_config = {
@@ -153,103 +211,154 @@ def run(args: argparse.Namespace) -> None:
     best_epoch = 0
     best_step = 0
     best_validation = None
+    best_selection_score = float("-inf")
     start = time.monotonic()
     optimizer_step = 0
 
     with trace_path.open("w", encoding="utf-8", buffering=1) as trace:
         epoch = 0
-        while optimizer_step < args.steps:
-            sampler.set_epoch(epoch)
-            model.train()
-            loss_sum = 0.0
-            steps = 0
-            for batch in loader:
-                if optimizer_step >= args.steps:
-                    break
-                if len(set(batch["stimulus_ids"])) != len(batch["stimulus_ids"]):
-                    raise RuntimeError("Duplicate stimulus in training batch")
-                eeg = batch["eeg"].to(device, non_blocking=True)
-                mask = batch["mask"].to(device, non_blocking=True)
-                frozen_text = batch["text"].to(device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                eeg_vectors = model.encode_eeg(eeg, mask)
-                text_vectors = model.encode_text(frozen_text)
-                small_dim = cfg["capacities"]["small"]
-                small_logits = model.score(
-                    eeg_vectors, text_vectors, small_dim, cfg["capacities"]["small_temperature"]
+        for phase in phases:
+            phase_step_target = optimizer_step + int(phase["steps"])
+            phase_epoch = 0
+            while optimizer_step < phase_step_target:
+                sampler.set_epoch(epoch)
+                model.train()
+                for batch in loader:
+                    if optimizer_step >= phase_step_target:
+                        break
+                    if len(set(batch["stimulus_ids"])) != len(batch["stimulus_ids"]):
+                        raise RuntimeError("Duplicate stimulus in training batch")
+                    eeg = batch["eeg"].to(device, non_blocking=True)
+                    mask = batch["mask"].to(device, non_blocking=True)
+                    frozen_text = batch["text"].to(device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    eeg_vectors = model.encode_eeg(eeg, mask)
+                    text_vectors = model.encode_text(frozen_text)
+                    logits_by_dimension = [
+                        model.score(
+                            eeg_vectors, text_vectors, dimension,
+                            cfg["capacities"].get("temperature", cfg["capacities"].get(
+                                "small_temperature" if index == 0 else "large_temperature", 0.07
+                            )),
+                        ) for index, dimension in enumerate(dimensions)
+                    ]
+                    small_logits, large_logits = logits_by_dimension[0], logits_by_dimension[-1]
+                    lambda_relation = (
+                        cfg["teacher"]["lambda_relation"]
+                        if variant["relation_mode"] != "none" else 0.0
+                    )
+                    relations = (
+                        text_relation_target(
+                            frozen_text, cfg["teacher"]["relation_temperature"],
+                            mode=variant["relation_mode"],
+                        ) if lambda_relation > 0 else None
+                    )
+                    if multi_capacity:
+                        loss, capacity_loss_map = weighted_capacity_loss(
+                            logits_by_dimension, phase["weights"]
+                        )
+                        capacity_losses = [capacity_loss_map[str(index)]
+                                           for index in range(len(dimensions))]
+                        relation_loss = (negative_relation_loss(small_logits, relations)
+                                         if lambda_relation > 0 else small_logits.sum() * 0.0)
+                        loss = loss + lambda_relation * relation_loss
+                        components = {
+                            **{f"hard_{dimension}": part.detach()
+                               for dimension, part in zip(dimensions, capacity_losses)},
+                            "relation": relation_loss.detach(),
+                        }
+                    else:
+                        capacity_losses = ([hard_pair_loss(logits) for logits in logits_by_dimension]
+                                           if args.variant == "nested_hard" else None)
+                        loss, components = spna_objective(
+                            small_logits, large_logits, relations,
+                            lambda_relation=lambda_relation,
+                            alpha_small=variant["alpha_small"],
+                            alpha_large=variant["alpha_large"],
+                        )
+                    if (capacity_losses is not None and (optimizer_step == 0
+                            or (optimizer_step + 1) % 25 == 0) and phase["select"]):
+                        shared_parameters = [parameter for parameter in model.parameters()
+                                             if parameter.requires_grad]
+                        grad_diagnostics = gradient_conflict_diagnostics(
+                            {str(dimension): part for dimension, part
+                             in zip(dimensions, capacity_losses)}, shared_parameters
+                        )
+                    else:
+                        grad_diagnostics = None
+                    if not torch.isfinite(loss):
+                        raise RuntimeError(f"Non-finite loss at epoch={epoch}")
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["grad_clip"])
+                    optimizer.step()
+                    optimizer_step += 1
+                    record = {
+                        "step": optimizer_step,
+                        "epoch": epoch + 1,
+                        "phase": phase["name"],
+                        "train_loss": float(loss.detach()),
+                        "capacity_losses": {
+                            key: float(value) for key, value in components.items()
+                            if key.startswith("hard_")
+                        } if multi_capacity else {
+                            "small": float(components["small"]),
+                            "large": float(components["large"]),
+                        },
+                        "relation_loss": float(components["relation"]),
+                        "lambda_relation": lambda_relation,
+                        "capacity_weights": phase["weights"],
+                        "gradient_conflicts": grad_diagnostics,
+                        "seconds": time.monotonic() - start,
+                        "max_cuda_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
+                    }
+                    trace.write(json.dumps(record) + "\n")
+                    if optimizer_step == 1 or optimizer_step % 25 == 0:
+                        print(json.dumps(record), flush=True)
+                epoch += 1
+                phase_epoch += 1
+                validation = evaluate_validation(
+                    model, validation_data, cfg, device, evaluation_dimensions
                 )
-                large_logits = model.score(
-                    eeg_vectors, text_vectors, cfg["model"]["embedding_dim"],
-                    cfg["capacities"]["large_temperature"],
+                current_small_r1 = validation[str(evaluation_dimensions[0])]["r@1"]
+                selection_score = sum(
+                    weight * validation[str(dimension)]["r@1"]
+                    for dimension, weight in zip(evaluation_dimensions, selection_weights)
                 )
-                lambda_relation = (
-                    cfg["teacher"]["lambda_relation"]
-                    if variant["relation_mode"] != "none" else 0.0
-                )
-                relations = (
-                    text_relation_target(
-                        frozen_text, cfg["teacher"]["relation_temperature"],
-                        mode=variant["relation_mode"],
-                    ) if lambda_relation > 0 else None
-                )
-                loss, components = spna_objective(
-                    small_logits, large_logits, relations,
-                    lambda_relation=lambda_relation,
-                    alpha_small=variant["alpha_small"],
-                    alpha_large=variant["alpha_large"],
-                )
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite loss at epoch={epoch}")
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["grad_clip"])
-                optimizer.step()
-                optimizer_step += 1
-                loss_sum += float(loss.detach())
-                steps += 1
-                record = {
+                trace.write(json.dumps({
+                    "epoch": epoch,
+                    "phase": phase["name"],
+                    "phase_epoch": phase_epoch,
                     "step": optimizer_step,
-                    "epoch": epoch + 1,
-                    "train_loss": float(loss.detach()),
-                    "hard_small_loss": float(components["small"]),
-                    "hard_large_loss": float(components["large"]),
-                    "relation_loss": float(components["relation"]),
-                    "lambda_relation": lambda_relation,
+                    "validation": validation,
+                    "validation_selection_score": selection_score,
                     "seconds": time.monotonic() - start,
-                    "max_cuda_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
-                }
-                trace.write(json.dumps(record) + "\n")
-                if optimizer_step == 1 or optimizer_step % 25 == 0:
-                    print(json.dumps(record), flush=True)
-            epoch += 1
-            validation = evaluate_validation(model, validation_data, cfg, device)
-            current_small_r1 = validation["small"]["r@1"]
-            trace.write(json.dumps({
-                "epoch": epoch,
-                "step": optimizer_step,
-                "validation": validation,
-                "validation_small_r1": current_small_r1,
-                "seconds": time.monotonic() - start,
-            }) + "\n")
-            if current_small_r1 > best_small_r1:
-                best_small_r1 = current_small_r1
-                best_epoch = epoch
-                best_step = optimizer_step
-                best_validation = validation
-                torch.save(
-                    {
-                        "config": cfg,
-                        "variant": args.variant,
-                        "seed": args.seed,
-                        "train_fraction": args.train_fraction,
-                        "train_stimuli": len(train_data.stimulus_ids),
-                        "epoch": best_epoch,
-                        "step": best_step,
-                        "validation": best_validation,
-                        "selected_by": "best validation small-capacity full-bank R@1",
-                        "model_state": model.state_dict(),
-                    },
-                    output_dir / "best.pt",
-                )
+                }) + "\n")
+                if phase["select"] and selection_score > best_selection_score:
+                    best_selection_score = selection_score
+                    best_small_r1 = current_small_r1
+                    best_epoch = epoch
+                    best_step = optimizer_step
+                    best_validation = validation
+                    torch.save(
+                        {
+                            "config": cfg,
+                            "variant": args.variant,
+                            "seed": args.seed,
+                            "train_fraction": args.train_fraction,
+                            "train_stimuli": len(train_data.stimulus_ids),
+                            "epoch": best_epoch,
+                            "step": best_step,
+                            "validation": best_validation,
+                            "capacity_dimensions": dimensions,
+                            "capacity_weights": weights,
+                            "evaluation_dimensions": evaluation_dimensions,
+                            "selection_weights": selection_weights,
+                            "validation_selection_score": selection_score,
+                            "selected_by": selection_description,
+                            "model_state": model.state_dict(),
+                        },
+                        output_dir / "best.pt",
+                    )
     (output_dir / "run.json").write_text(json.dumps({
         "variant": args.variant,
         "seed": args.seed,
@@ -261,8 +370,15 @@ def run(args: argparse.Namespace) -> None:
         "best_step": best_step,
         "best_validation_small_r1": best_small_r1,
         "best_validation": best_validation,
+        "capacity_dimensions": dimensions,
+        "capacity_weights": weights,
+        "evaluation_dimensions": evaluation_dimensions,
+        "selection_weights": selection_weights,
+        "validation_selection_score": best_selection_score,
+        "phases": [{"name": phase["name"], "steps": phase["steps"],
+                    "weights": phase["weights"]} for phase in phases],
         "elapsed_seconds": time.monotonic() - start,
-        "selected_by": "best validation small-capacity full-bank R@1",
+        "selected_by": selection_description,
         "test_evaluated": False,
     }, indent=2), encoding="utf-8")
 

@@ -112,6 +112,20 @@ The suite evaluates all six full-data variants and D-only/SPNA-CARG at 25% and 5
 
 Training evaluates validation small-capacity full-bank R@1 after each epoch and saves the best epoch as `best.pt`; it does not read test metrics. Run test evaluation only after model and hyperparameters have been selected. Repeat with five seeds for the paper protocol.
 
+## Focused three-capacity training experiment
+
+`config.mpnet_three_capacity.example.json` configures 64D/128D/256D nested prefixes with hard-pair CE weights `[0.35, 0.15, 0.50]`. `nested_three` trains all three capacities jointly; `staged_nested_three` first trains the 256D hard-pair objective for 25% of the step budget, then fine-tunes all three capacities. Both select checkpoints by mean validation full-bank R@1 across 64D/128D/256D, and training traces record pairwise gradient cosine diagnostics every 25 optimizer steps. The targeted runner compares those two schedules with the current two-capacity `nested_hard` baseline and does not run unrelated ablations:
+
+```bash
+python run_capacity_training.py \
+  --config /home/song/projects/spna/code/config.mpnet_three_capacity.example.json \
+  --output /home/song/projects/spna/runs/three_capacity_20261111 \
+  --python /home/song/projects/spna/.venv/bin/python \
+  --seeds 42 43 44 45 46 --devices 1 2 3 --steps 1000
+```
+
+The test evaluator reports retrieval metrics separately for each saved capacity. The runner saves the aggregate in `capacity_summary.json` and keeps run-level checkpoints and traces under the output directory.
+
 ## Configuration choices still requiring validation
 
 The example configs use `d_s=64`, `D=256`, `lambda_relation=0.1`, batch size 72, Adam with learning rate 1e-4 and no weight decay; the generic Qwen config uses `T_T=0.1`, and the FLAN-specific config uses `T_T=0.05`. The relation target `Q_neg^T` and student distribution `P_neg^64` are each normalized over non-paired candidates only; the relation KL is added separately to the two hard-pair CE terms. These values are starting points, not validated optima. Tune `lambda_relation`, `relation_temperature`, and capacity weights using validation data only. The training code selects the best validation small-capacity full-bank R@1 checkpoint after each epoch.

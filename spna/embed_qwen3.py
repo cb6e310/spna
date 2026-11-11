@@ -1,4 +1,4 @@
-"""Build frozen Qwen3-Embedding text vectors using a local model directory only."""
+"""Build frozen text vectors from a local encoder model directory only."""
 
 from __future__ import annotations
 
@@ -23,20 +23,25 @@ def last_token_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -
     return hidden_states[rows, lengths]
 
 
+def masked_mean_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    valid = attention_mask.to(dtype=hidden_states.dtype).unsqueeze(-1)
+    return (hidden_states * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+
+
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--encoder", choices=("qwen3", "flan_t5"), default="qwen3")
+    parser.add_argument("--encoder", choices=("qwen3", "flan_t5", "mpnet"), default="qwen3")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--instruction-prefix", default="")
     args = parser.parse_args()
     if not args.model_path.is_dir():
         raise FileNotFoundError(
-            f"Local Qwen3 model directory is unavailable: {args.model_path}; no download attempted"
+            f"Local model directory is unavailable: {args.model_path}; no download attempted"
         )
     rows = read_manifest(args.manifest)
     texts_by_id = {}
@@ -48,7 +53,10 @@ def main() -> None:
     texts = [args.instruction_prefix + texts_by_id[key] for key in stimulus_ids]
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, local_files_only=True, trust_remote_code=True, padding_side="left"
+        args.model_path,
+        local_files_only=True,
+        trust_remote_code=(args.encoder == "qwen3"),
+        padding_side=("right" if args.encoder == "mpnet" else "left"),
     )
     model_cls = T5EncoderModel if args.encoder == "flan_t5" else AutoModel
     model = model_cls.from_pretrained(
@@ -68,9 +76,13 @@ def main() -> None:
         ).to("cuda")
         outputs = model(**tokens)
         if args.encoder == "flan_t5":
-            valid = tokens["attention_mask"].bool()
-            hidden = outputs.last_hidden_state.float().masked_fill(~valid[..., None], 0)
-            embeddings = hidden.sum(1) / valid.sum(1, keepdim=True)
+            embeddings = masked_mean_pool(
+                outputs.last_hidden_state.float(), tokens["attention_mask"]
+            )
+        elif args.encoder == "mpnet":
+            embeddings = masked_mean_pool(
+                outputs.last_hidden_state.float(), tokens["attention_mask"]
+            )
         else:
             embeddings = last_token_pool(outputs.last_hidden_state, tokens["attention_mask"])
         # Qwen3 embeddings are cosine-normalized at extraction. GLIM's FLAN
@@ -91,7 +103,8 @@ def main() -> None:
     metadata = {
         "model": str(args.model_path.resolve()),
         "encoder": args.encoder,
-        "pooling": ("attention-mask mean of encoder token states" if args.encoder == "flan_t5"
+        "pooling": ("attention-mask mean of encoder token states"
+                    if args.encoder in {"flan_t5", "mpnet"}
                     else "last non-padding token; left padding"),
         "normalization": "L2" if args.encoder == "qwen3" else "none",
         "max_length": args.max_length,

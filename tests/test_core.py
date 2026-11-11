@@ -2,12 +2,19 @@ import unittest
 
 import torch
 
+from spna.embed_qwen3 import masked_mean_pool
 from spna.losses import hard_pair_loss, negative_relation_loss, spna_objective, text_relation_target
 from spna.metrics import retrieval_metrics
 from spna.model import ModelConfig, SPNA
 
 
 class SPNACoreTests(unittest.TestCase):
+    def test_masked_mean_pool_ignores_padding(self):
+        hidden = torch.tensor([[[1.0, 3.0], [3.0, 5.0], [99.0, 99.0]]])
+        mask = torch.tensor([[1, 1, 0]])
+        pooled = masked_mean_pool(hidden, mask)
+        self.assertTrue(torch.equal(pooled, torch.tensor([[2.0, 4.0]])))
+
     def test_relations_are_valid_off_diagonal_distributions(self):
         teacher = torch.randn(5, 12, requires_grad=True)
         relations = text_relation_target(teacher, 0.2)

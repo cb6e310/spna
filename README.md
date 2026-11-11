@@ -37,7 +37,7 @@ python prepare_zuco2.py \
   --output ./data/zuco2 --seed 42
 ```
 
-The text embedding command requires an already-present local Qwen3-Embedding-8B directory. It sets `local_files_only=True` and stops if the supplied path is missing; it never downloads model files.
+The text embedding command requires an already-present local model directory. It sets `local_files_only=True` and stops if the supplied path is missing; it never downloads model files.
 
 ```bash
 python -m spna.embed_qwen3 \
@@ -47,6 +47,16 @@ python -m spna.embed_qwen3 \
 ```
 
 The Qwen implementation uses left padding, last-token pooling, and L2 normalization. Texts are embedded without a query-only instruction because each stimulus is an item in a symmetric text-neighborhood graph.
+
+For the `sentence-transformers/all-mpnet-base-v2` teacher, use the locally cached ModelScope snapshot and masked mean pooling. MPNet vectors are stored unnormalized, matching the FLAN teacher convention; the learned projection and relation-target softmax handle scale. The frozen ZuCo2 cache used by the current ablation has 662 stimuli and 768 dimensions.
+
+```bash
+python -m spna.embed_qwen3 \
+  --encoder mpnet \
+  --manifest ./data/zuco2/zuco2_manifest.csv \
+  --model-path /path/to/all-mpnet-base-v2 \
+  --output ./data/zuco2/all_mpnet_base_v2_mean.npz
+```
 
 ## Train and evaluate
 
@@ -66,6 +76,18 @@ For the cached FLAN-T5-large teacher on the 4090 server, start from
 `config.flan_t5_large.example.json`. Its `relation_temperature` and
 `lambda_relation` are independent settings for the teacher distribution and
 the relation-loss weight.
+
+For all-mpnet-base-v2, start from `config.all_mpnet_base_v2.example.json` and
+set the manifest and cache paths for the server. The five-seed, 50-run ablation
+command used for this teacher is:
+
+```bash
+python run_key_ablations.py \
+  --config /home/song/projects/spna/code/config.all_mpnet_base_v2.example.json \
+  --output /home/song/projects/spna/runs/ablations_all_mpnet_20261111 \
+  --python /home/song/projects/spna/.venv/bin/python \
+  --seeds 42 43 44 45 46 --devices 1 2 3 --steps 500
+```
 
 The default `benchmark` protocol preserves the fixed 24-candidate GLIM-style evaluation. Use `--protocol full_bank` for all unique test stimuli, or `--protocol both` to report both protocols in one JSON file. Full-bank results include small- and full-capacity R@1/R@5/MRR; the 24-candidate benchmark remains a separate secondary comparison.
 

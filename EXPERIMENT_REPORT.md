@@ -10,15 +10,26 @@
 
 在全体训练刺激构成的 529 候选库中，`T_T=0.1` 的归一化熵均值为 0.962，Top-1/Top-5 概率质量为 1.30%/4.81%。真实教师分布与随机置换关系的平均行 Spearman 为 0.002，说明置换破坏了排序关联。最近邻检查同时发现合理的同类语义邻居和标点/措辞近重复文本；前者例子包括不同州长简介和演员简介，后者包括仅有标点差异的同一人物描述。内容词 Jaccard 最近邻均值为 0.084，句长差中位数为 5 词。上述词面指标是轻量诊断，不是人工语义标注。
 
+审计复现信息：seed 42，回放 500 个 optimizer steps、530 个训练刺激、batch size 72；每个 anchor 平均出现在 68.76 个候选中。不同温度下候选排序一致（rank stability = 1.0），温度只改变分布概率质量：
+
+| 温度 | 归一化熵均值 | Top-1 概率质量 | Top-5 概率质量 |
+|---:|---:|---:|---:|
+| 0.05 | 0.800 | 16.87% | 43.35% |
+| 0.1（原配置） | 0.945 | 6.36% | 22.14% |
+| 0.2 | 0.986 | 3.26% | 13.60% |
+| 0.5 | 0.998 | 2.09% | 9.72% |
+
+完整训练库的 529 个候选在 `T_T=0.1` 下归一化熵均值为 0.962，Top-1/Top-5 概率质量为 1.30%/4.81%。真实关系与置换关系的平均行 Spearman 为 0.0022，扁平 Pearson 为 -0.00047。最近邻诊断中的词面 Jaccard 均值为 0.084（中位数 0.050），最近邻词数差中位数为 5。最近邻既有合理的类别语义（如不同州长或演员简介），也有仅标点不同的重复描述；这些词面诊断不等同人工语义标注。源 manifest SHA-256：`35db5dc675d09094fd401f31b59dc93e341f643b08dc0c719d12c221490b3b90`；FLAN 文本缓存 SHA-256：`fbab246bb4791b6071da87b072483511462d273800cdc92dbf32cd83d5b7937c`。
+
 ### 目标函数实现
 
 按修订方案，训练目标已改为 `0.5 L_Hard^64 + 0.5 L_Hard^256 + lambda_relation L_Rel^64`。关系项为 `KL(Q_neg^T || P_neg^64)`；教师目标和小容量学生分布均仅在非配对候选上逐行归一化，对角配对候选不接收关系 KL 梯度。配置独立暴露 `lambda_relation` 与 `relation_temperature`，FLAN 示例初值分别为 0.1 和 0.05。训练继续在每个 epoch 后用验证集 small-capacity full-bank R@1 选择 checkpoint，测试集仅用于最终评测。
 
-实现验证：核心测试 6 项、GLIM 增量损失测试 1 项通过；负例 KL 的对角梯度为零，教师张量无梯度。seed 47 的 24-step smoke train 完成 3 个 epoch，按验证 small-capacity full-bank R@1 选中 epoch 1（step 8），并成功完成 held-out 测试。该短运行的 24 候选 Top-1/5/10 为 4.44%/21.57%/42.13%，66 刺激 full-bank 小容量 R@1 为 2.22%；只证明训练、checkpoint 选择和测试链路可运行，不用于性能结论。运行目录：`/home/song/projects/spna/runs/spna_negative_relation_smoke_20261111/spna_carg/fraction_1/seed_47/`。
+实现验证：核心测试 6 项、GLIM 增量损失测试 1 项通过；负例 KL 的对角梯度为零，教师张量无梯度。seed 47 的 24-step smoke train 完成 3 个 epoch，按验证 small-capacity full-bank R@1 选中 epoch 1（step 8），并成功完成 held-out 测试。该短运行的 24 候选正常 EEG Top-1/5/10 为 4.44%/21.57%/42.13%；高斯噪声控制为 3.98%/22.41%/41.11%，循环错配控制为 4.44%/21.94%/40.83%。66 刺激 full-bank 的 64维 R@1/R@5/MRR 为 2.22%/7.77%/7.77%，256维为 1.39%/6.85%/6.92%。这些短运行结果只证明训练、checkpoint 选择和测试链路可运行，不用于性能结论。
 
 ### 完整重训结果
 
-2026-11-11 启动的 500-step、5-seed 套件现已全部完成，共 50/50 个训练和测试运行，汇总记录无失败。所有 checkpoint 均按验证集 small-capacity full-bank R@1 选择；最佳 epoch 范围为 12–217，均值为 69.76。测试只在选定 checkpoint 上执行。输出目录：`/home/song/projects/spna/runs/ablations_flan_negative_relation_20261111/`；汇总文件：`ablation_summary.json`。
+2026-11-11 启动的 500-step、5-seed 套件现已全部完成，共 50/50 个训练和测试运行，汇总记录无失败。所有 checkpoint 均按验证集 small-capacity full-bank R@1 选择；最佳 epoch 范围为 12–217，均值为 69.76。测试只在选定 checkpoint 上执行。原始运行位于 4090 的 `/home/song/projects/spna/runs/ablations_flan_negative_relation_20261111/`；聚合及逐次结果已并入本报告。
 
 主指标为 66 个唯一测试刺激上的 full-bank EEG→Text 小容量（64维）R@1。表中为 5 个种子的均值 ± sample SD；R@1、R@5、MRR 均以百分比表示。
 
@@ -42,6 +53,25 @@
 | 100%（530个刺激） | 2.20% ± 0.34% | 2.46% ± 0.51% | +0.26 pp |
 
 在全量数据下，真实关系 SPNA-CARG 比 D-only 高 0.26 个百分点、比 Nested-Hard 高 0.17 个百分点，但比随机置换关系低 0.11 个百分点。低数据量比较中，CARG 在 25% 基本与 D-only 持平，在 50% 有描述性提升。整体没有显示真实关系优于置换关系，当前结果不支持关系身份带来稳定的特异收益。以上是 5 个种子的描述性均值和标准差，未进行显著性检验；固定 500 optimizer steps 也意味着低比例训练子集被重复采样更多次，不应将其解释为固定 epoch 或固定样本暴露量的学习曲线。
+
+### 早期 1000-step D-only 重跑
+
+4090 上另有两组 seed 42–44 的全量 D-only 1000-step 结果。首轮按固定 1000 步 checkpoint 测试，验证指标仅作诊断；retry 组按验证集 64维 full-bank R@1 选 checkpoint。两组都使用相同 66 刺激 full-bank 与 24 候选兼容评测。它们是早期独立重跑，不并入上方 500-step 六变体主比较。
+
+| 运行组 | Seed | 最佳验证 epoch/step | 验证 64维 R@1 | 测试 64维 R@1 | 测试 256维 R@1 | 24候选 Top-1/5/10 |
+|---|---:|---:|---:|---:|---:|---:|
+| 固定步数首轮 | 42 | 固定步数 | 3.11% | 2.78% | 3.70% | 8.06% / 34.72% / 61.30% |
+| 固定步数首轮 | 43 | 固定步数 | 3.29% | 2.78% | 3.89% | 8.80% / 36.48% / 61.39% |
+| 固定步数首轮 | 44 | 固定步数 | 2.37% | 2.22% | 3.98% | 7.87% / 35.74% / 59.54% |
+| 验证选优 retry | 42 | 103 / 824 | 4.57% | 3.05% | 3.89% | 8.15% / 34.54% / 58.15% |
+| 验证选优 retry | 43 | 95 / 760 | 4.20% | 2.31% | 4.53% | 8.43% / 34.26% / 61.30% |
+| 验证选优 retry | 44 | 84 / 672 | 3.84% | 2.59% | 3.15% | 9.17% / 35.46% / 58.70% |
+
+固定步数首轮的 64维 full-bank R@1 为 2.59% ± 0.32%，256维为 3.85% ± 0.14%；验证选优 retry 对应为 2.65% ± 0.37% 和 3.85% ± 0.69%。每组仅 3 个种子，均值与标准差仅作记录；不能据此归因验证选优对泛化表现的因果影响。
+
+### 数据完整性与预处理
+
+ZuCo2 manifest 共 11,222 条记录、662 个刺激，按刺激隔离为训练/验证/测试 530/66/66 个刺激，对应 9,046/1,095/1,081 条记录，split 间刺激重叠为 0。EEG 由 500 Hz 重采样至 128 Hz，移除空的第 105 通道，保留 104 个有效通道并补齐至 128 通道、最多 10 秒（1,280 个时间点），不做振幅归一化。该处理使用与 GLIM 对齐的 `scipy.signal.resample`。manifest SHA-256：`35db5dc675d09094fd401f31b59dc93e341f643b08dc0c719d12c221490b3b90`。
 
 ## 2026-11-10 — ZuCo2：SPNA 与 GLIM 对比（Qwen3 / FLAN-T5）
 
@@ -77,11 +107,7 @@ FLAN-SPNA 按任务结果：ZuCo2 task2 Top-1/5/10 为 7.06%/27.59%/51.21%（453
 - 评测：测试刺激按清单顺序形成 45 个批次，每批 24 个不同刺激；报告 Top-1/5/10，并运行 seed-42 float32 高斯噪声与循环错配 EEG 控制。
 - FLAN 权重已由本地直连传输至 4090，大小 3,132,668,804 bytes；SHA-256：`a9dd06ce490f139af36e9eb77dd3758b4fd07a08a73d5a1abe5ff2591e2d388e`。
 
-### 结果文件
-
-- FLAN-SPNA 汇总：`/home/song/projects/spna/runs/spna_carg_flan/spna_carg/fraction_1/seed_42/test_glim.json`
-- Qwen-SPNA 汇总：`/home/song/projects/spna/runs/spna_carg/fraction_1/seed_42/test_glim.json`
-- GLIM 数值为此前 ZuCo2 子集评测记录（1,105 条）；该历史记录与本次 SPNA 重建的测试批次规模不同。
+该历史比较的源评测 JSON 原位于 4090 的 `runs/spna_carg_flan/` 与 `runs/spna_carg/`；指标已保留在本节及后续 GLIM 公平重训复核中。GLIM 9.59%/38.64%/62.17% 为 1,105 条 ZuCo2 子集的历史记录，与 SPNA 当前 1,080 条兼容评测规模不同。
 
 ### 限制
 
@@ -132,7 +158,7 @@ FLAN-SPNA 按任务结果：ZuCo2 task2 Top-1/5/10 为 7.06%/27.59%/51.21%（453
 - 文本关系教师：冻结 FLAN-T5-large 缓存；训练配置与 2026-11-10 主实验一致，低/高容量为 64/256，`eta=0.2`、容量权重各 0.5，batch size 72，Adam 学习率 `1e-4`。
 - 全量机制设置为 D-only、Small-only、Nested-Hard、SPNA-CARG、Uniform Smoothing、Shuffled Relations；另对 D-only 与 SPNA-CARG 运行 25%/50% 配对规模，所有设置使用 seed 42–46 和 500 optimizer steps。
 - 任务主评测为 66 候选 full-bank EEG→Text 检索，分别报告 64/256 维 R@1、R@5、MRR。原 24 候选 GLIM 风格评测另存为次要兼容指标，不能与 full-bank 数值混为一谈。
-- 可复现输出位于 4090：`/home/song/projects/spna/runs/ablations_flan/`。汇总：`ablation_summary.json`；每个 run 保留 `config.json`、`run.json`、`best.pt` 与 `test_metrics.json`。源代码评测入口新增 `--protocol benchmark|full_bank|both`。
+- 该组可复现输出曾位于 4090：`/home/song/projects/spna/runs/ablations_flan/`。本报告中的指标来自该目录的汇总及逐 run 结果；源代码评测入口支持 `--protocol benchmark|full_bank|both`。
 
 ### 解释边界
 
